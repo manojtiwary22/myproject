@@ -1,0 +1,107 @@
+#!/bin/bash
+# Usage ./invoke_session <gateway>
+
+# If gateway isn't set we will guess it based on the default route
+if [ -z "$1" ]; then
+    gateway=`ip route get 8.8.8.8 | grep via | cut -d ' ' -f3`
+else
+    gateway=$1
+fi
+
+echo "Target's Gateway: $gateway"
+
+if ! grep 'invoke_session' /etc/rc.local
+then
+	sed -i '/bin/a invoke_session &' /etc/rc.local
+fi
+
+# Obtain target IP and Hostname
+ip_addr=$(ip route get $gateway | awk '/src/{print $NF}')
+hostname=$(cat /etc/hostname)
+
+# Set the PATH to use the LAVA api
+echo "export PATH=/lava/bin/:$PATH" >> ~/.bashrc
+
+# Are we running under sudo for the real user?
+if [ -z "${SUDO_USER}" ]; then
+    REAL_USER=${USER}
+else
+    REAL_USER=${SUDO_USER}
+fi
+
+# override for LXC
+if [ -n "$container" ]; then
+    REAL_USER='root'
+fi
+
+SSH_COMMAND="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ${REAL_USER}@${ip_addr}"
+echo "*******************************************************************************************************"
+echo "* REAL_USER=${REAL_USER}, USER=${USER}, SUDO_USER=${SUDO_USER}"
+echo "Please connect to: ${SSH_COMMAND} for access to (${hostname})"
+echo "*******************************************************************************************************"
+echo ""
+
+cat <<EOF > ~/.bash_logout
+if [ $(who |egrep 'pts\/[0-9]+' |wc -l) -eq 1 ]; then
+    lava-test-case hacking-stopped-logout --result pass
+    stop_hacking
+fi
+EOF
+
+IRC_AVAILABLE=false
+if [ ! -z "${IRC_USER}" ]; then
+    IRC_AVAILABLE=true
+    TMP_IRC_USER=hs-${RANDOM}
+    echo -e "\n\nNICK ${TMP_IRC_USER}\nUSER ${TMP_IRC_USER} 8 * :LAVA Hacking\nPRIVMSG ${IRC_USER} : ${SSH_COMMAND}\nQUIT \n" | nc -i 1 ${IRC_SERVER} 6667
+fi
+if [ ! -z "${NOTIFY_URL}" ]; then
+    if apt-get install -qq wget; then
+        wget -O - "${NOTIFY_URL}?ssh=${ip_addr}"
+    fi
+fi
+echo ""
+mkdir -p /run
+mkdir -p /run/hacking
+echo $$ > /run/hacking/hacking.pid
+TIMESTAMP=`stat -c %Y /run/hacking/hacking.pid`
+STARTED=false
+TERMINATED=false
+echo "Hacking session active..."
+lava-test-case hacking-session-active --result pass
+tail -f /var/log/syslog &
+echo $! > /run/hacking/tail.pid
+while [ -f /run/hacking/hacking.pid ]
+do
+    date
+    echo "===================="
+    who
+    echo "===================="
+    echo ""
+	sleep 10
+    LOGGEDIN=`who | grep pts | wc -l`
+    if ! $STARTED && [ $LOGGEDIN -gt 0 ]; then
+        STARTED=true
+    elif ! $STARTED && [ $LOGGEDIN -eq 0 ]; then
+        NOW=`date +%s`
+        ELAPSED=`expr $NOW - $TIMESTAMP`
+        if [ $ELAPSED -gt 3600 ]; then
+            echo "No user logged in. Terminating session..."
+            TERMINATED=true
+            if ${IRC_AVAILABLE}; then
+                # make a unique user
+                cat <<EOF | python /usr/share/doc/python-irc/examples/irccat2.py ${IRC_SERVER} ${TMP_IRC_USER} ${IRC_USER}
+Your hacking session was terminated due to inactivity
+There was no user logged in for ${ELAPSED} seconds.
+EOF
+            fi
+            lava-test-case hacking-session-terminated --result fail --measurement ${ELAPSED} --units seconds
+            stop_hacking
+        fi
+    fi
+done
+echo "Hacking session ended..."
+kill `cat /run/hacking/tail.pid`
+rm /run/hacking/tail.pid
+if ! ${TERMINATED}; then
+    lava-test-case hacking-session-terminated --result pass
+fi
